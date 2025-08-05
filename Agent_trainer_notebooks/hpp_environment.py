@@ -544,3 +544,351 @@ class HybridPowerPlantEnv(gym.Env):
 
     def close(self):
         pass
+        class BatteryStorage:
+    def __init__(self, total_capacity_kwh=1000, min_backup_kwh=200, max_charge_rate_mw=50, max_discharge_rate_mw=50):
+        self.total_capacity_kwh = total_capacity_kwh
+        self.current_soc_kwh = 0  # Initialize at 0
+        self.min_backup_kwh = min_backup_kwh
+        self.max_charge_rate_mw = max_charge_rate_mw
+        self.max_discharge_rate_mw = max_discharge_rate_mw
+
+    def charge(self, power_mw, duration_hours):
+        """Charges the battery."""
+        potential_energy_increase = power_mw * duration_hours
+        actual_charging_power_mw = min(power_mw, self.max_charge_rate_mw)
+        actual_energy_increase = actual_charging_power_mw * duration_hours
+
+        energy_to_charge = min(actual_energy_increase, self.total_capacity_kwh - self.current_soc_kwh)
+
+        self.current_soc_kwh += energy_to_charge
+        return energy_to_charge
+
+    def discharge(self, power_mw, duration_hours):
+        """Discharges the battery."""
+        potential_energy_decrease = power_mw * duration_hours
+        actual_discharging_power_mw = min(power_mw, self.max_discharge_rate_mw)
+        actual_energy_decrease = actual_discharging_power_mw * duration_hours
+
+        # Ensure discharge doesn't go below min_backup_kwh, but allow discharge below if it's not for backup purposes
+        # For now, simplifying to not go below 0 or min_backup_kwh if critical.
+        # Let's prioritize not going below min_backup_kwh for general discharge.
+        max_dischargeable_energy = self.current_soc_kwh - self.min_backup_kwh if self.current_soc_kwh > self.min_backup_kwh else 0
+        energy_to_discharge = min(actual_energy_decrease, max_dischargeable_energy, self.current_soc_kwh)
+
+        self.current_soc_kwh -= energy_to_discharge
+        return energy_to_discharge
+
+    def get_current_soc(self):
+        """Returns the current state of charge in kWh."""
+        return self.current_soc_kwh
+
+    def get_available_charge_capacity(self):
+        """Returns the available capacity for charging in kWh."""
+        # Convert MW to kWh for a given duration (assuming 1 hour duration for simplicity here)
+        # A more accurate calculation would consider the time step of simulation
+        # For now, let's consider the available space up to total capacity
+        return self.total_capacity_kwh - self.current_soc_kwh
+
+    def get_available_discharge_capacity(self):
+        """Returns the available capacity for discharging in kWh."""
+        # Available discharge capacity is the current SOC above the minimum backup
+        return max(0, self.current_soc_kwh - self.min_backup_kwh)
+def handle_grid_interaction(plant_output_mw, grid_demand_mw, battery, electricity_price_buy=0.15, electricity_price_sell=0.10):
+    """
+    Handles interaction with the grid based on power plant output and grid demand.
+
+    Args:
+        plant_output_mw: The total power output of the plant components (excluding battery discharge).
+        grid_demand_mw: The current power demand from the grid.
+        battery: The BatteryStorage object.
+        electricity_price_buy: Price to buy electricity from the grid ($/MWh).
+        electricity_price_sell: Price to sell electricity to the grid ($/MWh).
+
+    Returns:
+        A tuple containing:
+            power_bought_mw: Power bought from the grid in MW.
+            power_sold_mw: Power sold to the grid in MW.
+            battery_charge_mw: Power used to charge the battery in MW.
+            battery_discharge_mw: Power discharged from the battery in MW.
+    """
+    power_deficit = grid_demand_mw - plant_output_mw
+    power_bought_mw = 0
+    power_sold_mw = 0
+    battery_charge_mw = 0
+    battery_discharge_mw = 0
+
+    if power_deficit > 0:
+        # There is a deficit, try to meet it with battery discharge
+        discharge_from_battery_mw = min(power_deficit, battery.max_discharge_rate_mw)
+        # Ensure we don't discharge below the minimum backup
+        discharge_from_battery_kwh = discharge_from_battery_mw * 1 # Assuming 1 hour time step for simplicity
+        actual_discharge_kwh = battery.discharge(discharge_from_battery_mw, 1) # Discharge for 1 hour
+        actual_discharge_mw = actual_discharge_kwh / 1 # Convert back to MW for 1 hour step
+
+        remaining_deficit = power_deficit - actual_discharge_mw
+
+        if remaining_deficit > 0:
+            # Still a deficit after battery discharge, buy from grid
+            power_bought_mw = remaining_deficit
+            battery_discharge_mw = actual_discharge_mw
+        else:
+            # Battery discharge met or exceeded the deficit
+            battery_discharge_mw = power_deficit # Only discharge what was needed
+            # Note: If actual_discharge_mw > power_deficit, the excess is not sold back automatically here.
+            # The battery.discharge method already handles not discharging below min_backup.
+            # If the actual discharge was more than the deficit, it means the battery could supply it.
+            # The remaining_deficit would be <= 0.
+            # We set battery_discharge_mw to power_deficit because that's how much was needed from the battery
+            # to cover the deficit. The battery's internal state is updated by battery.discharge.
+
+
+    elif power_deficit < 0:
+        # There is a surplus
+        power_surplus = -power_deficit
+
+        # First, try to charge the battery
+        charge_to_battery_mw = min(power_surplus, battery.max_charge_rate_mw)
+        charge_to_battery_kwh = charge_to_battery_mw * 1 # Assuming 1 hour time step
+        actual_charge_kwh = battery.charge(charge_to_battery_mw, 1) # Charge for 1 hour
+        actual_charge_mw = actual_charge_kwh / 1 # Convert back to MW for 1 hour step
+
+        remaining_surplus = power_surplus - actual_charge_mw
+
+        if remaining_surplus > 0:
+            # Still a surplus after charging battery, sell to grid
+            power_sold_mw = remaining_surplus
+            battery_charge_mw = actual_charge_mw
+        else:
+            # Battery absorbed all or more than the surplus
+            battery_charge_mw = power_surplus # Only charge what was available as surplus
+            # The battery.charge method handles not exceeding total capacity.
+            # If actual_charge_mw > power_surplus, it means the battery could absorb more
+            # than the current surplus, which is fine. The remaining_surplus would be <= 0.
+            # We set battery_charge_mw to power_surplus because that's how much was available
+            # to charge the battery from the surplus. The battery's internal state is updated by battery.charge.
+
+    else:
+        # power_deficit is 0, plant output exactly meets grid demand
+        pass # No grid interaction needed
+
+    return power_bought_mw, power_sold_mw, battery_charge_mw, battery_discharge_mw
+# Combine solar and wind power, filling missing values with 0
+if not solar_data_full.empty and not wind_data_full.empty:
+    combined_renewable_power_mw = solar_data_full['solar_power_MW'].add(wind_data_full['wind_power_MW'], fill_value=0)
+
+    # Display the head of the combined renewable power data
+    print("Head of Combined Renewable Power (MW):")
+    display(combined_renewable_power_mw.head())
+else:
+    print("Cannot combine renewable power. One or both of the datasets are empty.")
+if 'simulation_df' in locals() and not simulation_df.empty:
+    print("Grid Demand (MW) for each hour of the simulation:")
+    display(simulation_df['grid_demand_mw'])
+else:
+    print("Simulation results DataFrame (simulation_df) not found or is empty. Please run the simulation cell first.")
+import requests
+
+base_url = "https://raw.githubusercontent.com/fassi16/RL_MS_Thesis/main/data/data_testing/scenario_datasets/"
+files_to_download = [
+    "PV_load_2020_profile.csv",
+    "WT_load_2020_profile.csv",
+    "House_load_2020_profile.csv"
+]
+
+for file_name in files_to_download:
+    url = base_url + file_name
+    response = requests.get(url)
+
+    if response.status_code == 200:
+        with open(file_name, "wb") as f:
+            f.write(response.content)
+        print(f"Downloaded {file_name} successfully.")
+    else:
+        print(f"Failed to download {file_name}. Status code: {response.status_code}")
+        import requests
+
+base_url = "https://raw.githubusercontent.com/fassi16/RL_MS_Thesis/main/data/data_testing/scenario_datasets/"
+file_name = "households_load_profile.csv" # New file name provided by the user
+url = base_url + file_name
+response = requests.get(url)
+
+if response.status_code == 200:
+    with open(file_name, "wb") as f:
+        f.write(response.content)
+    print(f"Downloaded {file_name} successfully.")
+else:
+    print(f"Failed to download {file_name}. Status code: {response.status_code}")
+    # Instantiate the environment to load the data
+try:
+    env = HybridPowerPlantEnv()
+    print("Environment instantiated and data loaded.")
+
+    # Check if the processed dataframes are available and not empty
+    # Note: The environment now stores data in dictionaries, not dataframes.
+    # We'll convert them back to dataframes for plotting ease.
+    solar_df = pd.DataFrame.from_dict(env.solar_profile_dict, orient='index')
+    wind_df = pd.DataFrame.from_dict(env.wind_profile_dict, orient='index')
+    load_df = pd.DataFrame.from_dict(env.load_profile_dict, orient='index')
+
+
+    if not solar_df.empty and not wind_df.empty and not load_df.empty:
+
+        # Create a figure and axes for plotting
+        fig, axes = plt.subplots(3, 1, figsize=(15, 12), sharex=True)
+
+        # Plot solar generation
+        axes[0].plot(solar_df.index, solar_df['solar_power_MW'], label='Solar Power (MW)')
+        axes[0].set_title('Solar Generation Over Time')
+        axes[0].set_ylabel('Power (MW)')
+        axes[0].legend()
+        axes[0].grid(True)
+
+        # Plot wind generation
+        axes[1].plot(wind_df.index, wind_df['wind_power_MW'], label='Wind Power (MW)', color='orange')
+        axes[1].set_title('Wind Generation Over Time')
+        axes[1].set_ylabel('Power (MW)')
+        axes[1].legend()
+        axes[1].grid(True)
+
+        # Plot household load
+        axes[2].plot(load_df.index, load_df['load_mw'], label='Household Load (MW)', color='red')
+        axes[2].set_title('Household Load Over Time')
+        axes[2].set_ylabel('Power (MW)')
+        axes[2].set_xlabel('Time Step (hour)') # Common x-axis label
+        axes[2].legend()
+        axes[2].grid(True)
+
+        # Adjust layout and display the plots
+        plt.tight_layout()
+        plt.show()
+
+    else:
+        print("Data profiles not available or are empty after loading into the environment. Cannot visualize profiles.")
+
+except NameError:
+    print("Error: HybridPowerPlantEnv is not defined. Please run the cell defining the environment first.")
+except Exception as e:
+    print(f"An error occurred during plotting: {e}")
+    # Instantiate the environment
+try:
+    env = HybridPowerPlantEnv()
+    print("Environment instantiated.")
+
+    # Reset the environment
+    obs, info = env.reset()
+    print("Environment reset.")
+    print("Initial Observation:", obs)
+    print("Initial Info:", info)
+
+    # Simulation loop
+    total_reward = 0
+    simulation_info = []
+
+    print("\nStarting simulation...")
+    # Use the adjusted simulation duration from the environment
+    for time_step in range(env.simulation_duration_hours):
+        # Choose a random action (for testing purposes)
+        action = env.action_space.sample()
+
+        # Apply the action and step the environment
+        next_obs, reward, terminated, truncated, info = env.step(action)
+
+        # Accumulate reward
+        total_reward += reward
+
+        # Store info
+        simulation_info.append(info)
+
+        # Optional: Print step info for debugging
+        # print(f"Time Step: {time_step}, Action: {action}, Reward: {reward:.2f}, Total Reward: {total_reward:.2f}, SOC: {info['battery_soc_kwh']:.2f}, Load: {info['current_load_mw']:.2f}, Renewable: {info['renewable_output_mw']:.2f}, Bought: {info['power_bought_mw']:.2f}, Sold: {info['power_sold_mw']:.2f}, Unmet: {info['unmet_demand_mw']:.2f}")
+
+
+        # Check for termination
+        if terminated:
+            print(f"Simulation terminated at time step {time_step}")
+            break
+
+    print("\nSimulation finished.")
+    print(f"Total accumulated reward: {total_reward:.2f}")
+
+    # Analyze stored information
+    print("\nAnalyzing simulation information:")
+    # Convert list of dictionaries to a pandas DataFrame for easier analysis
+    simulation_df = pd.DataFrame(simulation_info)
+
+    print("\nSimulation DataFrame Head:")
+    display(simulation_df.head())
+
+    print("\nSimulation Summary Statistics:")
+    display(simulation_df.describe())
+
+    # Plot key metrics over time - Separated Plots
+    if not simulation_df.empty:
+        # Plot Solar Generation
+        plt.figure(figsize=(15, 5))
+        plt.plot(simulation_df['time_step'], simulation_df['solar_power_mw'], label='Solar Output (MW)')
+        plt.ylabel('Power (MW)')
+        plt.xlabel('Time Step (hour)')
+        plt.title('Solar Generation Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+        # Plot Wind Generation
+        plt.figure(figsize=(15, 5))
+        plt.plot(simulation_df['time_step'], simulation_df['wind_power_mw'], label='Wind Output (MW)', color='orange')
+        plt.ylabel('Power (MW)')
+        plt.xlabel('Time Step (hour)')
+        plt.title('Wind Generation Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+        # Plot Battery Energy (SOC)
+        plt.figure(figsize=(15, 5))
+        plt.plot(simulation_df['time_step'], simulation_df['battery_soc_kwh'], label='Battery SOC (kWh)', color='green')
+        plt.ylabel('Battery SOC (kWh)')
+        plt.xlabel('Time Step (hour)')
+        plt.title('Battery State of Charge Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+        # Plot Power Bought from Grid
+        plt.figure(figsize=(15, 5))
+        plt.plot(simulation_df['time_step'], simulation_df['power_bought_mw'], label='Power Bought (MW)', color='red')
+        plt.ylabel('Power (MW)')
+        plt.xlabel('Time Step (hour)')
+        plt.title('Power Bought from Grid Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+        # Plot Power Sold to Grid
+        plt.figure(figsize=(15, 5))
+        plt.plot(simulation_df['time_step'], simulation_df['power_sold_mw'], label='Power Sold (MW)', color='blue')
+        plt.ylabel('Power (MW)')
+        plt.xlabel('Time Step (hour)')
+        plt.title('Power Sold to Grid Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+        # Plot Unmet Demand
+        plt.figure(figsize=(15, 5))
+        plt.plot(simulation_df['time_step'], simulation_df['unmet_demand_mw'], label='Unmet Demand (MW)', color='purple', linestyle='--')
+        plt.ylabel('Power (MW)')
+        plt.xlabel('Time Step (hour)')
+        plt.title('Unmet Demand Over Time')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+    else:
+        print("Simulation DataFrame is empty. Cannot generate plots.")
+
+
+except NameError as e:
+    print(f"Error: {e}. Make sure HybridPowerPlantEnv, BatteryStorage, HybridPowerPlant are defined and available.")
+except Exception as e:
+    print(f"An error occurred during simulation: {e}")
