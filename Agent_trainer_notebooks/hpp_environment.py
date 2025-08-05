@@ -1,466 +1,546 @@
-import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
 import pandas as pd
+import numpy as np
+import gymnasium as gym
 import os
+import matplotlib.pyplot as plt
 
-# Define paths for data files - ADJUST THESE PATHS AS NECESSARY
-SOLAR_DATA_PATH = 'https://github.com/fassi16/RL_MS_Thesis/blob/main/data/data_testing/scenario_datasets/PV_load_2020_profile.csv'  # Make sure this path is correct
-WIND_DATA_PATH = 'https://github.com/fassi16/RL_MS_Thesis/blob/main/data/data_testing/scenario_datasets/WT_load_2020_profile.csv'    # Make sure this path is correct
-CONSUMER_DATA_PATH = 'https://github.com/fassi16/RL_MS_Thesis/blob/main/data/data_testing/scenario_datasets/households_load_profile.csv'    # Make sure this path is correct
+# Define the environment classes again to ensure they are available and updated
+class HybridPowerPlant:
+    def __init__(self, total_capacity_mw):
+        self.total_capacity_mw = total_capacity_mw
+        self.components = {}
+
+    def add_component(self, name, capacity_mw, type):
+        if name in self.components:
+            print(f"Warning: Component '{name}' already exists. Overwriting.")
+        self.components[name] = {'capacity_mw': capacity_mw, 'type': type}
+        print(f"Added component: {name} ({type}) with capacity {capacity_mw} MW")
+
+    def get_total_installed_capacity(self):
+        total_installed = sum(comp['capacity_mw'] for comp in self.components.values())
+        return total_installed
+
+    def get_current_power_output(self, current_solar_mw, current_wind_mw):
+        """Calculates total renewable power output."""
+        return current_solar_mw + current_wind_mw
+
+
+class BatteryStorage:
+    def __init__(self, total_capacity_kwh=1000, min_backup_kwh=200, max_charge_rate_mw=50, max_discharge_rate_mw=50):
+        self.total_capacity_kwh = total_capacity_kwh
+        self.current_soc_kwh = 0
+        self.min_backup_kwh = min_backup_kwh
+        self.max_charge_rate_mw = max_charge_rate_mw
+        self.max_discharge_rate_mw = max_discharge_rate_mw
+
+    def charge(self, power_mw, duration_hours=1):
+        actual_charging_power_mw = min(power_mw, self.max_charge_rate_mw)
+        actual_energy_increase = actual_charging_power_mw * duration_hours
+        energy_to_charge = min(actual_energy_increase, self.total_capacity_kwh - self.current_soc_kwh)
+        self.current_soc_kwh += energy_to_charge
+        return energy_to_charge
+
+    def discharge(self, power_mw, duration_hours=1):
+        actual_discharging_power_mw = min(power_mw, self.max_discharge_rate_mw)
+        actual_energy_decrease = actual_discharging_power_mw * duration_hours
+        # Ensure discharge doesn't go below the minimum backup
+        max_dischargeable_energy = max(0, self.current_soc_kwh - self.min_backup_kwh)
+        energy_to_discharge = min(actual_energy_decrease, max_dischargeable_energy)
+        energy_to_discharge = max(0, energy_to_discharge) # Ensure we don't return negative energy
+
+        self.current_soc_kwh -= energy_to_discharge
+        return energy_to_discharge
+
+    def get_current_soc(self):
+        return self.current_soc_kwh
+
+    def get_available_charge_capacity(self):
+        return self.total_capacity_kwh - self.current_soc_kwh
+
+    def get_available_discharge_capacity(self):
+        return max(0, self.current_soc_kwh - self.min_backup_kwh)
+
 
 class HybridPowerPlantEnv(gym.Env):
-    """
-    A Reinforcement Learning environment representing a Hybrid Power Plant
-    with Solar, Wind, and Battery storage, interacting with the grid.
-    """
-    def __init__(self, time_step_duration_hours=1, battery_capacity_kwh=10000,
-                 battery_max_charge_mw=2000, battery_max_discharge_mw=2000,
-                 battery_efficiency=0.95, grid_buy_price_per_kwh=0.15,
-                 grid_sell_price_per_kwh=0.10, penalty_unmet_demand=1.0):
+    def __init__(self, total_plant_capacity_mw=100, battery_capacity_kwh=1000, battery_min_backup_kwh=200, battery_max_charge_mw=50, battery_max_discharge_mw=50, simulation_duration_hours=8760): # Set duration to a full year
         super().__init__()
 
-        # Load data within the __init__ method
-        try:
-            self.solar_data_full = pd.read_csv(SOLAR_DATA_PATH)
-            self.wind_data_full = pd.read_csv(WIND_DATA_PATH)
-            self.grid_data_full = pd.read_csv(GRID_DATA_PATH)
-
-            # Ensure time index exists and is sorted
-            for df in [self.solar_data_full, self.wind_data_full, self.grid_data_full]:
-                 if 'time' in df.columns:
-                     df['time'] = pd.to_datetime(df['time'])
-                     df.set_index('time', inplace=True)
-                     df.sort_index(inplace=True)
-                 else:
-                     print(f"Warning: 'time' column not found in a data file.")
-
-
-        except FileNotFoundError as e:
-            print(f"Error loading data file: {e}")
-            # Handle the missing file, e.g., raise an error or use dummy data
-            self.solar_data_full = pd.DataFrame()
-            self.wind_data_full = pd.DataFrame()
-            self.grid_data_full = pd.DataFrame()
-
-
-        # Combine renewable power, filling missing values with 0 after loading
-        if not self.solar_data_full.empty and not self.wind_data_full.empty:
-            # Align indices before adding
-            common_index = self.solar_data_full.index.union(self.wind_data_full.index)
-            solar_aligned = self.solar_data_full.reindex(common_index).fillna(0)
-            wind_aligned = self.wind_data_full.reindex(common_index).fillna(0)
-
-            if 'solar_power_MW' in solar_aligned.columns and 'wind_power_MW' in wind_aligned.columns:
-                 self.combined_renewable_power_mw = solar_aligned['solar_power_MW'].add(wind_aligned['wind_power_MW'], fill_value=0)
-            else:
-                 print("Warning: 'solar_power_MW' or 'wind_power_MW' columns not found after aligning data.")
-                 self.combined_renewable_power_mw = pd.Series(0, index=common_index)
-
-        elif not self.solar_data_full.empty and 'solar_power_MW' in self.solar_data_full.columns:
-             self.combined_renewable_power_mw = self.solar_data_full['solar_power_MW'].copy()
-        elif not self.wind_data_full.empty and 'wind_power_MW' in self.wind_data_full.columns:
-             self.combined_renewable_power_mw = self.wind_data_full['wind_power_MW'].copy()
-        else:
-            print("Warning: No valid solar or wind data loaded.")
-            self.combined_renewable_power_mw = pd.Series() # Empty series if no data
-
-        # Ensure grid demand data is available
-        if not self.grid_data_full.empty and 'grid_demand_MW' in self.grid_data_full.columns:
-             self.grid_demand_full_mw = self.grid_data_full['grid_demand_MW'].copy()
-        else:
-             print("Warning: No valid grid demand data loaded.")
-             self.grid_demand_full_mw = pd.Series() # Empty series
-
-        # Align all data based on the union of all indices
-        all_indices = self.combined_renewable_power_mw.index.union(self.grid_demand_full_mw.index)
-        self.combined_renewable_power_mw = self.combined_renewable_power_mw.reindex(all_indices).fillna(0)
-        self.grid_demand_full_mw = self.grid_demand_full_mw.reindex(all_indices).fillna(0)
-
-        # Ensure data is not empty after loading and aligning
-        if self.combined_renewable_power_mw.empty or self.grid_demand_full_mw.empty or len(self.combined_renewable_power_mw) != len(self.grid_demand_full_mw):
-            raise ValueError("Data loading or alignment failed. Renewable or grid demand data is empty or has mismatched lengths.")
-
-
-        self.data_len = len(self.combined_renewable_power_mw)
-        self.time_step_duration_hours = time_step_duration_hours
-        self.battery_capacity_kwh = battery_capacity_kwh
-        self.battery_max_charge_mw = battery_max_charge_mw
-        self.battery_max_discharge_mw = battery_max_discharge_mw
-        self.battery_efficiency = battery_efficiency
-        self.grid_buy_price_per_kwh = grid_buy_price_per_kwh
-        self.grid_sell_price_per_kwh = grid_sell_price_per_kwh
-        self.penalty_unmet_demand = penalty_unmet_demand
-
-        # Define action space: [battery_charge_discharge_mw, power_to_grid_mw]
-        # battery_charge_discharge_mw: positive for charge, negative for discharge
-        # power_to_grid_mw: positive for selling to grid, negative for buying from grid
-        # Assuming reasonable bounds for power flow. Adjust as needed.
-        low_action = np.array([-self.battery_max_discharge_mw, -np.inf], dtype=np.float32) # Can discharge up to max, can buy potentially infinite power (in reality limited by grid connection)
-        high_action = np.array([self.battery_max_charge_mw, np.inf], dtype=np.float32)   # Can charge up to max, can sell potentially infinite power (in reality limited by grid connection)
-
-        # Let's refine the action space based on common practices
-        # Action 0: Battery action (charge/discharge). Range [-battery_max_discharge_mw, battery_max_charge_mw]
-        # Action 1: Grid interaction. Can be power bought (negative) or sold (positive).
-        # A simpler approach might be two separate actions: one for battery (charge/discharge)
-        # and one for grid (buy/sell). Or a single action vector.
-
-        # Let's define a continuous action space: [battery_power_mw, grid_power_mw]
-        # battery_power_mw: positive for charging, negative for discharging, bounded by max_charge/discharge
-        # grid_power_mw: positive for selling to grid, negative for buying from grid.
-        # We'll let the agent decide how much to buy/sell, but apply penalties for unmet demand.
-        self.action_space = spaces.Box(low=np.array([-self.battery_max_discharge_mw, -np.inf], dtype=np.float32),
-                                       high=np.array([self.battery_max_charge_mw, np.inf], dtype=np.float32),
-                                       dtype=np.float32)
-
-
-        # Define observation space: [current_time_step, renewable_output_mw, grid_demand_mw, battery_soc_kwh]
-        # current_time_step: Integer representing the current index in the data
-        # renewable_output_mw: Renewable power available at the current time step
-        # grid_demand_mw: Grid demand at the current time step
-        # battery_soc_kwh: Current state of charge of the battery
-        low_obs = np.array([0, -np.inf, -np.inf, 0], dtype=np.float32)
-        high_obs = np.array([self.data_len - 1, np.inf, np.inf, self.battery_capacity_kwh], dtype=np.float32)
-        self.observation_space = spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
-
-        # Initialize state variables
+        self.total_plant_capacity_mw = total_plant_capacity_mw
+        self.simulation_duration_hours = simulation_duration_hours # Tentative duration, will be adjusted
         self.current_time_step = 0
-        self.battery_soc_kwh = self.battery_capacity_kwh / 2 # Start with battery half full
-        self.time_step_duration_hours = time_step_duration_hours
+
+        self.plant = HybridPowerPlant(total_capacity_mw=self.total_plant_capacity_mw)
+        self.plant.add_component('SolarFarm', capacity_mw=60, type='solar')
+        self.plant.add_component('WindTurbines', capacity_mw=40, type='wind')
+        self.plant.add_component('Battery', capacity_mw=battery_max_charge_mw, type='battery')
+
+        self.battery = BatteryStorage(total_capacity_kwh=battery_capacity_kwh,
+                                      min_backup_kwh=battery_min_backup_kwh,
+                                      max_charge_rate_mw=battery_max_charge_mw,
+                                      max_discharge_rate_mw=battery_max_discharge_mw)
+
+        self.solar_profile = None
+        self.wind_profile = None
+        self.load_profile = None
+        self._load_and_process_profiles() # Load data here
+
+        # Adjust simulation duration based on loaded data
+        if self.solar_profile is not None and self.wind_profile is not None and self.load_profile is not None:
+             min_len = min(len(self.solar_profile), len(self.wind_profile), len(self.load_profile))
+             if min_len < self.simulation_duration_hours:
+                  print(f"Warning: Loaded data shorter than requested simulation duration ({min_len} vs {self.simulation_duration_hours}). Adjusting simulation duration.")
+                  self.simulation_duration_hours = min_len
+        else:
+             # If any profile failed to load, use a small default duration
+             self.simulation_duration_hours = 24
+             print(f"Warning: One or more data profiles failed to load or are empty. Using default simulation duration of {self.simulation_duration_hours} hours.")
+
+
+        # Convert DataFrames to dictionaries after finalizing length
+        if self.solar_profile is not None:
+             # Reset index to 0-based integers before converting to dict
+             self.solar_profile = self.solar_profile.reset_index(drop=True)
+             self.solar_profile_dict = self.solar_profile.to_dict('index')
+        else:
+             self.solar_profile_dict = {i: {'solar_power_MW': 0.0} for i in range(self.simulation_duration_hours)}
+
+        if self.wind_profile is not None:
+             # Reset index to 0-based integers before converting to dict
+             self.wind_profile = self.wind_profile.reset_index(drop=True)
+             self.wind_profile_dict = self.wind_profile.to_dict('index')
+        else:
+             self.wind_profile_dict = {i: {'wind_power_MW': 0.0} for i in range(self.simulation_duration_hours)}
+
+        if self.load_profile is not None:
+             # Reset index to 0-based integers before converting to dict
+             self.load_profile = self.load_profile.reset_index(drop=True)
+             self.load_profile_dict = self.load_profile.to_dict('index')
+        else:
+             self.load_profile_dict = {i: {'load_mw': 0.0} for i in range(self.simulation_duration_hours)}
+
+
+        # Determine max possible renewable output and load for observation space
+        max_solar = self.solar_profile['solar_power_MW'].max() if self.solar_profile is not None and not self.solar_profile.empty else self.plant.components['SolarFarm']['capacity_mw']
+        max_wind = self.wind_profile['wind_power_MW'].max() if self.wind_profile is not None and not self.wind_profile.empty else self.plant.components['WindTurbines']['capacity_mw']
+        max_load = self.load_profile['load_mw'].max() if self.load_profile is not None and not self.load_profile.empty else 200
+
+        low_obs = np.array([
+            0, # time_step
+            0.0, # battery_soc_kwh
+            0.0, # solar_power_mw
+            0.0, # wind_power_mw
+            0.0 # grid_demand_mw (which is now load)
+        ], dtype=np.float32)
+        high_obs = np.array([
+            self.simulation_duration_hours - 1, # time_step
+            self.battery.total_capacity_kwh, # battery_soc_kwh
+            max_solar, # solar_power_mw
+            max_wind, # wind_power_mw
+            max_load # grid_demand_mw (load)
+        ], dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=low_obs, high=high_obs, dtype=np.float32)
+
+
+        self.action_space = gym.spaces.Box(low=np.array([-1.0], dtype=np.float32), # -1 for max charge
+                                           high=np.array([1.0], dtype=np.float32), # +1 for max discharge
+                                           dtype=np.float32)
+
+        self.cost_buy = 0.25 # Increased cost to incentivize selling/self-consumption
+        self.revenue_sell = 0.10
+        self.penalty_unmet_demand = 5.0 # Increased penalty
+        self.battery_usage_cost = 0.005
+
+
+    def _load_and_process_profiles(self):
+        print("Loading and processing real-world data profiles...")
+
+        # Load solar data
+        solar_file_path = 'PV_load_2020_profile.csv'
+        try:
+            # Attempt to read with multiple separators
+            try:
+                 solar_data_raw = pd.read_csv(solar_file_path, header=None, sep='\t', engine='python', skiprows=1)
+            except Exception:
+                 solar_data_raw = pd.read_csv(solar_file_path, header=None, sep=',', engine='python', skiprows=1)
+
+            print(f"Raw solar energy data loaded successfully from {solar_file_path}")
+
+            if solar_data_raw.shape[1] >= 2:
+                 time_col = solar_data_raw.columns[0]
+                 power_col = solar_data_raw.columns[1]
+                 solar_data_full = solar_data_raw.copy()
+
+                 # Try multiple date formats
+                 solar_data_full['time'] = pd.to_datetime(solar_data_full[time_col], errors='coerce', format='%d/%m/%Y %H:%M')
+                 if solar_data_full['time'].isnull().all():
+                      solar_data_full['time'] = pd.to_datetime(solar_data_full[time_col], errors='coerce', infer_datetime_format=True)
+
+
+                 solar_data_full['solar_power'] = pd.to_numeric(solar_data_full[power_col], errors='coerce')
+                 solar_data_full = solar_data_full.dropna(subset=['time', 'solar_power']).copy()
+
+                 if not solar_data_full.empty:
+                     solar_data_full = solar_data_full.set_index('time')
+                     solar_data_full['solar_power_MW'] = solar_data_full['solar_power'] / 1_000_000 # Assuming W to MW
+                     self.solar_profile = solar_data_full[['solar_power_MW']].resample('H').mean().dropna()
+                     print(f"Processed solar data length: {len(self.solar_profile)}")
+                     print("Solar data loaded and processed successfully.")
+                 else:
+                     print("Warning: Solar data is empty after cleaning.")
+                     self.solar_profile = pd.DataFrame(columns=['solar_power_MW'])
+            else:
+                print("Error: Solar data file does not contain enough columns to process.")
+                self.solar_profile = pd.DataFrame(columns=['solar_power_MW'])
+
+        except FileNotFoundError:
+            print(f"Error: {solar_file_path} not found. Using dummy solar data.")
+            self.solar_profile = pd.DataFrame({'solar_power_MW': np.zeros(self.simulation_duration_hours)})
+            self.solar_profile.index = pd.to_datetime(pd.date_range(start='2020-01-01', periods=self.simulation_duration_hours, freq='H'))
+        except Exception as e:
+            print(f"An error occurred while loading or processing the solar data: {e}. Using dummy solar data.")
+            self.solar_profile = pd.DataFrame({'solar_power_MW': np.zeros(self.simulation_duration_hours)})
+            self.solar_profile.index = pd.to_datetime(pd.date_range(start='2020-01-01', periods=self.simulation_duration_hours, freq='H'))
+
+        print("-" * 30)
+
+        # Load wind data
+        wind_file_path = 'WT_load_2020_profile.csv'
+        try:
+            try:
+                 wind_data_raw = pd.read_csv(wind_file_path, header=None, sep='\t', engine='python', skiprows=1)
+                 if wind_data_raw.shape[1] < 2:
+                      wind_data_raw = pd.read_csv(wind_file_path, header=None, sep=',', engine='python', skiprows=1)
+
+            except Exception:
+                 wind_data_raw = pd.read_csv(wind_file_path, header=None, sep=',', engine='python', skiprows=1)
+
+
+            print(f"Raw wind energy data loaded successfully from {wind_file_path}")
+
+            if wind_data_raw.shape[1] >= 2:
+                time_col = wind_data_raw.columns[0]
+                power_col = wind_data_raw.columns[1]
+                wind_data_full = wind_data_raw.copy()
+
+                wind_data_full['time'] = pd.to_datetime(wind_data_full[time_col], errors='coerce', format='%d/%m/%Y %H:%M')
+                if wind_data_full['time'].isnull().all():
+                      wind_data_full['time'] = pd.to_datetime(wind_data_full[time_col], errors='coerce', infer_datetime_format=True)
+
+
+                wind_data_full['wind_power'] = pd.to_numeric(wind_data_full[power_col], errors='coerce')
+                wind_data_full = wind_data_full.dropna(subset=['time', 'wind_power']).copy()
+
+                if not wind_data_full.empty:
+                    wind_data_full = wind_data_full.set_index('time')
+                    wind_data_full['wind_power_MW'] = wind_data_full['wind_power'] / 1_000_000 # Corrected scaling to MW
+                    self.wind_profile = wind_data_full[['wind_power_MW']].resample('H').mean().dropna()
+                    print(f"Processed wind data length: {len(self.wind_profile)}")
+                    print("Wind data loaded and processed successfully.")
+                else:
+                    print("Warning: Wind data is empty after cleaning.")
+                    self.wind_profile = pd.DataFrame(columns=['wind_power_MW'])
+            else:
+                 print("Error: Wind data file does not contain expected columns or enough columns.")
+                 self.wind_profile = pd.DataFrame(columns=['wind_power_MW'])
+
+
+        except FileNotFoundError:
+            print(f"Error: {wind_file_path} not found. Using dummy wind data.")
+            self.wind_profile = pd.DataFrame({'wind_power_MW': np.zeros(self.simulation_duration_hours)})
+            self.wind_profile.index = pd.to_datetime(pd.date_range(start='2020-01-01', periods=self.simulation_duration_hours, freq='H'))
+        except Exception as e:
+            print(f"An error occurred while loading or processing the wind data: {e}. Using dummy wind data.")
+            self.wind_profile = pd.DataFrame({'wind_power_MW': np.zeros(self.simulation_duration_hours)})
+            self.wind_profile.index = pd.to_datetime(pd.date_range(start='2020-01-01', periods=self.simulation_duration_hours, freq='H'))
+
+        print("-" * 30)
+
+        # Load household load data
+        load_file_path = 'households_load_profile.csv' # Updated file name
+        try:
+            # Attempt to read with multiple separators, skipping first row
+            try:
+                 load_data_raw = pd.read_csv(load_file_path, header=None, sep='\t', engine='python', skiprows=1)
+                 if load_data_raw.shape[1] < 2:
+                      load_data_raw = pd.read_csv(load_file_path, header=None, sep=',', engine='python', skiprows=1)
+            except Exception:
+                 load_data_raw = pd.read_csv(load_file_path, header=None, sep=',', engine='python', skiprows=1)
+
+            print(f"Raw household load data loaded successfully from {load_file_path}")
+
+            if load_data_raw.shape[1] >= 2:
+                time_col = load_data_raw.columns[0]
+                load_col = load_data_raw.columns[1]
+                load_data_full = load_data_raw.copy()
+
+                load_data_full['time'] = pd.to_datetime(load_data_full[time_col], errors='coerce', format='%d/%m/%Y %H:%M')
+                if load_data_full['time'].isnull().all():
+                      load_data_full['time'] = pd.to_datetime(load_data_full[time_col], errors='coerce', infer_datetime_format=True)
+
+                load_data_full['load_W'] = pd.to_numeric(load_data_full[load_col], errors='coerce') # Assuming original data is in Watts
+                load_data_full = load_data_full.dropna(subset=['time', 'load_W']).copy()
+
+                if not load_data_full.empty:
+                    load_data_full = load_data_full.set_index('time')
+                    load_data_full['load_mw'] = load_data_full['load_W'] / 1_000_000 # Assuming W to MW
+                    self.load_profile = load_data_full[['load_mw']].resample('H').mean().dropna()
+                    print(f"Processed load data length: {len(self.load_profile)}")
+                    print("Household load data loaded and processed successfully.")
+                else:
+                    print("Warning: Household load data is empty after cleaning.")
+                    self.load_profile = pd.DataFrame(columns=['load_mw'])
+
+            else:
+                 print("Error: Household load data file does not contain expected columns or enough columns.")
+                 self.load_profile = pd.DataFrame(columns=['load_mw'])
+
+
+        except FileNotFoundError:
+            print(f"Error: {load_file_path} not found. Using dummy load data.")
+            hours = np.arange(self.simulation_duration_hours)
+            load = 50 + 50 * np.sin(2 * np.pi * (hours - 18) / 24)
+            load = np.maximum(load, 0)
+            self.load_profile = pd.DataFrame({'load_mw': load})
+            self.load_profile.index = pd.to_datetime(pd.date_range(start='2020-01-01', periods=self.simulation_duration_hours, freq='H'))
+        except Exception as e:
+            print(f"An error occurred while loading or processing the load data: {e}. Using dummy load data.")
+            hours = np.arange(self.simulation_duration_hours)
+            load = 50 + 50 * np.sin(2 * np.pi * (hours - 18) / 24)
+            load = np.maximum(load, 0)
+            self.load_profile = pd.DataFrame({'load_mw': load})
+            self.load_profile.index = pd.to_datetime(pd.date_range(start='2020-01-01', periods=self.simulation_duration_hours, freq='H'))
+
+
+        # Ensure all profiles exist and have data, then find the minimum length
+        profile_lengths = []
+        if self.solar_profile is not None and not self.solar_profile.empty:
+            profile_lengths.append(len(self.solar_profile))
+        if self.wind_profile is not None and not self.wind_profile.empty:
+             profile_lengths.append(len(self.wind_profile))
+        if self.load_profile is not None and not self.load_profile.empty:
+             profile_lengths.append(len(self.load_profile))
+
+        if profile_lengths:
+             min_len = min(profile_lengths)
+             print(f"Minimum profile length after processing: {min_len}")
+             self.simulation_duration_hours = min_len
+             print(f"Adjusting simulation duration to: {self.simulation_duration_hours} hours.")
+
+             # Reindex/trim all profiles to the minimum length and reset index to 0-based integers
+             if self.solar_profile is not None and not self.solar_profile.empty:
+                  self.solar_profile = self.solar_profile.iloc[:min_len].reset_index(drop=True)
+             else:
+                  self.solar_profile = pd.DataFrame({'solar_power_MW': np.zeros(self.simulation_duration_hours)})
+
+
+             if self.wind_profile is not None and not self.wind_profile.empty:
+                  self.wind_profile = self.wind_profile.iloc[:min_len].reset_index(drop=True)
+             else:
+                  self.wind_profile = pd.DataFrame({'wind_power_MW': np.zeros(self.simulation_duration_hours)})
+
+
+             if self.load_profile is not None and not self.load_profile.empty:
+                  self.load_profile = self.load_profile.iloc[:min_len].reset_index(drop=True)
+             else:
+                  self.load_profile = pd.DataFrame({'load_mw': np.zeros(self.simulation_duration_hours)})
+
+
+             # Convert trimmed and re-indexed DataFrames to dictionaries
+             self.solar_profile_dict = self.solar_profile.to_dict('index')
+             self.wind_profile_dict = self.wind_profile.to_dict('index')
+             self.load_profile_dict = self.load_profile.to_dict('index')
+
+
+        else:
+             print("Error: No valid data profiles were loaded. Simulation duration set to 0.")
+             self.simulation_duration_hours = 0
+             self.solar_profile_dict = {}
+             self.wind_profile_dict = {}
+             self.load_profile_dict = {}
+
+
+        print("\nProcessed Profile Heads (first 5 entries, indexed 0-based):")
+        if self.solar_profile_dict:
+            print("Solar Profile:")
+            display(pd.DataFrame.from_dict(dict(list(self.solar_profile_dict.items())[:5]), orient='index'))
+        if self.wind_profile_dict:
+            print("Wind Profile:")
+            display(pd.DataFrame.from_dict(dict(list(self.wind_profile_dict.items())[:5]), orient='index'))
+        if self.load_profile_dict:
+            print("Load Profile:")
+            display(pd.DataFrame.from_dict(dict(list(self.load_profile_dict.items())[:5]), orient='index'))
 
 
     def step(self, action):
-        # Ensure action is within bounds
-        action = np.clip(action, self.action_space.low, self.action_space.high)
+        if self.current_time_step >= self.simulation_duration_hours:
+            return np.zeros_like(self.observation_space.low), 0.0, True, False, {}
 
-        battery_action_mw = action[0]  # Positive for charging, negative for discharging
-        grid_action_mw = action[1]     # Positive for selling, negative for buying
+        action = np.clip(action, self.action_space.low, self.action_space.high)[0]
 
-        # Get current renewable output and grid demand
-        renewable_output_mw = self.combined_renewable_power_mw.iloc[self.current_time_step]
-        grid_demand_mw = self.grid_demand_full_mw.iloc[self.current_time_step]
+        # Get current renewable generation and load from profiles using 0-based index
+        current_solar_data = self.solar_profile_dict.get(self.current_time_step, {'solar_power_MW': 0.0})
+        current_wind_data = self.wind_profile_dict.get(self.current_time_step, {'wind_power_MW': 0.0})
+        current_load_data = self.load_profile_dict.get(self.current_time_step, {'load_mw': 0.0})
 
-        # --- Power Flow Logic ---
+        solar_power_mw_available = current_solar_data.get('solar_power_MW', 0.0)
+        wind_power_mw_available = current_wind_data.get('wind_power_MW', 0.0)
+        current_load_mw = current_load_data.get('load_mw', 0.0)
 
-        # 1. Handle battery charge/discharge attempt
-        battery_charge_attempt_mw = max(0, battery_action_mw)
-        battery_discharge_attempt_mw = abs(min(0, battery_action_mw))
+        renewable_output_mw = solar_power_mw_available + wind_power_mw_available
 
-        # Calculate maximum possible charge based on available renewable and battery capacity
-        # Available power for charging = renewable_output_mw + power_bought_for_charging (if applicable)
-        # Max charge power limited by battery_max_charge_mw
-        # Max charge energy limited by remaining battery capacity
+        # Calculate power balance relative to load
+        power_balance_vs_load = renewable_output_mw - current_load_mw
 
-        # For simplicity in this step function, let's assume battery action is the agent's
-        # desired charge/discharge, and we'll handle constraints.
-
+        power_bought_mw = 0
+        power_sold_mw = 0
+        unmet_demand_mw = 0
+        battery_charge_attempt_mw = 0
+        battery_discharge_attempt_mw = 0
         actual_battery_charge_mw = 0
         actual_battery_discharge_mw = 0
-        battery_delta_kwh = 0
-
-        # Attempt to charge the battery
-        if battery_charge_attempt_mw > 0:
-            # Power available from renewables for charging (can be used directly or via grid)
-            # Let's assume charging can come from renewables or grid based on grid_action_mw
-            # A more complex model would prioritize renewable charging.
-            # For this action space, battery_action_mw is the *net* power to/from battery.
-            # Let's assume positive battery_action_mw means drawing power from the system (renewables/grid) to charge.
-            # Negative battery_action_mw means supplying power from battery to the system.
-
-            # Let's reinterpret action[0] as the desired change in battery SOC in MW for the time step.
-            # Positive action[0] means increase SOC (charge), negative means decrease SOC (discharge).
-
-            desired_battery_power_mw = action[0] # Positive to charge, negative to discharge
-
-            if desired_battery_power_mw > 0: # Attempt to charge
-                # Power needed for charging
-                power_needed_for_charge_mw = desired_battery_power_mw
-                # Max power can draw for charging
-                max_charge_power_mw = min(power_needed_for_charge_mw, self.battery_max_charge_mw)
-                # Max energy can store in battery
-                max_charge_energy_kwh = (self.battery_capacity_kwh - self.battery_soc_kwh) / self.battery_efficiency # Account for efficiency
-                max_charge_power_based_on_capacity_mw = max_charge_energy_kwh / self.time_step_duration_hours
-
-                actual_battery_charge_mw = min(max_charge_power_mw, max_charge_power_based_on_capacity_mw)
-                battery_delta_kwh = actual_battery_charge_mw * self.time_step_duration_hours * self.battery_efficiency
-
-            elif desired_battery_power_mw < 0: # Attempt to discharge
-                 # Power to supply from battery
-                 power_to_supply_from_battery_mw = abs(desired_battery_power_mw)
-                 # Max power can discharge
-                 max_discharge_power_mw = min(power_to_supply_from_battery_mw, self.battery_max_discharge_mw)
-                 # Max energy can supply from battery
-                 max_discharge_energy_kwh = self.battery_soc_kwh * self.battery_efficiency # Account for efficiency
-                 max_discharge_power_based_on_capacity_mw = max_discharge_energy_kwh / self.time_step_duration_hours
-
-                 actual_battery_discharge_mw = min(max_discharge_power_mw, max_discharge_power_based_on_capacity_mw)
-                 battery_delta_kwh = -actual_battery_discharge_mw * self.time_step_duration_hours / self.battery_efficiency # Energy removed from battery
-
-            self.battery_soc_kwh += battery_delta_kwh
-            self.battery_soc_kwh = np.clip(self.battery_soc_kwh, 0, self.battery_capacity_kwh) # Ensure SOC is within bounds
+        net_battery_power_mw = 0
+        power_for_load_mw = 0
 
 
-        # 2. Calculate net power available/needed from the system (excluding grid interaction for now)
-        # Net power = Renewable Output + Battery Discharge - Battery Charge
-        # Positive net_system_output_mw means surplus power available
-        # Negative net_system_output_mw means deficit power needed
-        net_system_output_mw = renewable_output_mw + actual_battery_discharge_mw - actual_battery_charge_mw
+        # Action interpretation: -1 max charge, 1 max discharge
+        # Action will now control how much of the surplus/deficit the battery tries to handle
+        # Action range [-1, 0) for charging, (0, 1] for discharging
+        # Action = 0 means no battery action
 
-        # 3. Handle grid interaction and meet demand
-        # grid_action_mw: positive means selling to grid, negative means buying from grid
-        power_to_grid_attempt_mw = max(0, grid_action_mw)
-        power_from_grid_attempt_mw = abs(min(0, grid_action_mw))
+        desired_battery_action_mw = action * (self.battery.max_discharge_rate_mw if action >= 0 else self.battery.max_charge_rate_mw)
 
-        power_sold_mw = 0
-        power_bought_mw = 0
-        unmet_demand_mw = 0
+        # --- New logic based on user's requirement ---
+        if power_balance_vs_load >= 0:
+            # Renewable surplus or exact match for load
+            surplus_after_load = power_balance_vs_load
 
-        # If there is a surplus from the system, prioritize meeting local demand first (if any, though demand is abstracted as grid_demand_mw)
-        # and then sell excess to the grid based on agent's action
-        if net_system_output_mw > 0:
-            # Power available to meet demand or sell
-            power_available_mw = net_system_output_mw
+            # Use action to determine how much of the surplus attempts to charge the battery
+            battery_charge_attempt_mw = max(0, -desired_battery_action_mw) # Negative action means charge
+            battery_charge_attempt_mw = min(battery_charge_attempt_mw, surplus_after_load) # Cannot charge more than available surplus
 
-            # How much power does the agent want to sell to the grid?
-            desired_sell_to_grid_mw = power_to_grid_attempt_mw
+            actual_charge_kwh = self.battery.charge(battery_charge_attempt_mw, 1)
+            actual_battery_charge_mw = actual_charge_kwh / 1.0
+            net_battery_power_mw = -actual_battery_charge_mw
 
-            # Actual power sold is limited by available surplus
-            power_sold_mw = min(desired_sell_to_grid_mw, power_available_mw)
+            # Remaining surplus after charging battery is sold to the grid
+            power_sold_mw = surplus_after_load - actual_battery_charge_mw
+            power_for_load_mw = current_load_mw # Load was met by renewables
 
-            # Any remaining surplus is not used (could be curtailed in a real system)
-            # power_available_after_selling = power_available_mw - power_sold_mw
+        else:
+            # Renewable deficit compared to load
+            deficit_vs_load = -power_balance_vs_load
 
-            # If there is a deficit from the system, the agent must buy from the grid to meet demand
-        elif net_system_output_mw < 0:
-            # Power deficit that needs to be met
-            power_deficit_mw = abs(net_system_output_mw)
+            # Use action to determine how much of the deficit attempts to be met by battery discharge
+            battery_discharge_attempt_mw = max(0, desired_battery_action_mw) # Positive action means discharge
+            battery_discharge_attempt_mw = min(battery_discharge_attempt_mw, deficit_vs_load) # Cannot discharge more than needed for deficit
 
-            # How much power does the agent want to buy from the grid?
-            desired_buy_from_grid_mw = power_from_grid_attempt_mw
+            actual_discharge_kwh = self.battery.discharge(battery_discharge_attempt_mw, 1)
+            actual_battery_discharge_mw = actual_discharge_kwh / 1.0
+            net_battery_power_mw = actual_battery_discharge_mw
 
-            # The grid demand is the total power needed. The agent's 'buying' action
-            # should aim to cover the deficit.
+            # Remaining deficit after battery discharge needs to be bought from the grid
+            remaining_deficit = deficit_vs_load - actual_battery_discharge_mw
 
-            # Let's rethink the grid action based on meeting grid_demand_mw
-            # The power needed *from the grid* is grid_demand_mw - net_system_output_mw
-            # If net_system_output_mw is negative, this is grid_demand_mw + |net_system_output_mw|
-
-            # Let's simplify: the total power required at the grid connection point is grid_demand_mw.
-            # The power supplied by renewables and battery is net_system_output_mw.
-            # The difference must be supplied by the grid (bought) or is unmet demand.
-            # Or if net_system_output_mw > grid_demand_mw, the excess can be sold to the grid.
-
-            # Let's interpret grid_action_mw as the NET power flow at the grid connection point
-            # Positive grid_action_mw means power flows TO the grid (selling)
-            # Negative grid_action_mw means power flows FROM the grid (buying)
-
-            # The total power balance must be:
-            # Renewable Output + Battery Discharge - Battery Charge + Power from Grid - Power to Grid = Grid Demand
-            # net_system_output_mw + Power from Grid - Power to Grid = Grid Demand
-            # Power from Grid - Power to Grid = Grid Demand - net_system_output_mw
-
-            # So, the net grid flow (Power from Grid - Power to Grid) should ideally equal Grid Demand - net_system_output_mw
-            # The agent's action[1] is the desired net grid flow.
-
-            desired_net_grid_flow_mw = grid_action_mw # Positive to sell, negative to buy
-
-            # The required net grid flow to perfectly meet demand is grid_demand_mw - net_system_output_mw
-            required_net_grid_flow_mw = grid_demand_mw - net_system_output_mw
-
-            # If the agent's desired net grid flow is less than what's required to meet demand, there's unmet demand.
-            if desired_net_grid_flow_mw < required_net_grid_flow_mw:
-                unmet_demand_mw = required_net_grid_flow_mw - desired_net_grid_flow_mw
-                net_grid_flow_mw = desired_net_grid_flow_mw # Agent only managed this much net flow
+            if remaining_deficit > 0:
+                power_bought_mw = remaining_deficit
+                unmet_demand_mw = remaining_deficit # Unmet demand is covered by buying
+                power_for_load_mw = current_load_mw # Load is met by renewables + battery + bought power
             else:
-                # If the agent desires more grid flow than needed (e.g., wants to sell more than surplus, or buy less than deficit)
-                # The actual net grid flow is limited by the required amount to meet demand or the available surplus for selling.
-                # Let's assume the agent's action is a target, and the environment applies constraints.
-
-                # Option 1: Agent's action is a target net grid flow. Environment tries to achieve it.
-                # If agent wants to sell (positive desired_net_grid_flow_mw): Can only sell up to available surplus (net_system_output_mw - grid_demand_mw if positive).
-                # If agent wants to buy (negative desired_net_grid_flow_mw): Needs to buy at least the deficit (grid_demand_mw - net_system_output_mw if positive deficit).
-
-                # Let's stick to the interpretation of action[1] as desired net grid flow (positive = sell, negative = buy).
-
-                desired_net_grid_flow_mw = action[1]
-
-                # If desired net flow is positive (selling):
-                if desired_net_grid_flow_mw > 0:
-                    # Power available to sell = max(0, net_system_output_mw - grid_demand_mw)
-                    # Actual power sold is limited by desired amount and available power
-                    power_sold_mw = min(desired_net_grid_flow_mw, max(0, net_system_output_mw - grid_demand_mw))
-                    power_bought_mw = 0 # Cannot sell and buy simultaneously (net)
-                    net_grid_flow_mw = power_sold_mw # Net flow is positive (to grid)
-                    # Check if meeting demand resulted in surplus or deficit
-                    remaining_demand_or_surplus = net_system_output_mw - grid_demand_mw - power_sold_mw
-                    unmet_demand_mw = max(0, -remaining_demand_or_surplus) # Unmet if remaining is negative
-
-                # If desired net flow is negative (buying):
-                elif desired_net_grid_flow_mw < 0:
-                    # Power needed from grid = abs(desired_net_grid_flow_mw)
-                    # Power needed to meet demand after using system output = max(0, grid_demand_mw - net_system_output_mw)
-                    power_to_buy_mw = abs(desired_net_grid_flow_mw)
-
-                    # Actual power bought is limited by the amount needed to meet demand + any extra the agent wants to buy (e.g., for battery charging, though not explicitly modeled here)
-                    # Let's assume buying is primarily for meeting grid demand.
-                    power_bought_mw = power_to_buy_mw
-                    power_sold_mw = 0 # Cannot sell and buy simultaneously (net)
-                    net_grid_flow_mw = -power_bought_mw # Net flow is negative (from grid)
-
-                    # Check if buying was sufficient to meet demand
-                    power_after_grid_buy = net_system_output_mw + power_bought_mw
-                    unmet_demand_mw = max(0, grid_demand_mw - power_after_grid_buy)
+                power_bought_mw = 0
+                unmet_demand_mw = 0
+                power_for_load_mw = current_load_mw # Load is met by renewables + battery
 
 
-                # If desired net flow is zero:
-                else: # desired_net_grid_flow_mw == 0
-                    power_sold_mw = 0
-                    power_bought_mw = 0
-                    net_grid_flow_mw = 0
-                    # Unmet demand is the deficit if system output isn't enough
-                    unmet_demand_mw = max(0, grid_demand_mw - net_system_output_mw)
+        # Total power output including battery net power (for info/debugging, not directly used in new grid logic)
+        total_power_including_battery_mw = renewable_output_mw + net_battery_power_mw
 
-
-        # Convert power flows (MW) to energy (kWh) for the time step
-        power_bought_kwh = power_bought_mw * self.time_step_duration_hours
-        power_sold_kwh = power_sold_mw * self.time_step_duration_hours
-        unmet_demand_kwh = unmet_demand_mw * self.time_step_duration_hours
-        renewable_output_kwh = renewable_output_mw * self.time_step_duration_hours
-
-
-        # --- Calculate Reward ---
-        # Reward could be based on:
-        # - Cost of buying power from the grid
-        # - Revenue from selling power to the grid
-        # - Penalty for unmet demand
-        # - Cost/benefit of battery usage (optional, but can encourage efficient use)
 
         reward = 0
+        # Penalize unmet demand (which is now power bought if there's a deficit after battery)
+        reward -= unmet_demand_mw * self.penalty_unmet_demand
+        reward -= power_bought_mw * self.cost_buy # Still penalize buying power
 
-        # Cost of buying power
-        reward -= power_bought_kwh * self.grid_buy_price_per_kwh
+        # Reward selling to grid (only from renewable surplus after load and battery charging)
+        reward += power_sold_mw * self.revenue_sell
 
-        # Revenue from selling power
-        reward += power_sold_kwh * self.grid_sell_price_per_kwh
+        # Add a small cost for battery usage
+        reward -= (actual_battery_charge_mw + actual_battery_discharge_mw) * self.battery_usage_cost
 
-        # Penalty for unmet demand
-        reward -= unmet_demand_kwh * self.penalty_unmet_demand
+        # Penalty for dropping below minimum backup SOC
+        if self.battery.get_current_soc() < self.battery.min_backup_kwh:
+             reward -= (self.battery.min_backup_kwh - self.battery.get_current_soc()) * 0.1
 
-        # Optional: Add a small penalty for large battery charge/discharge to encourage smoother operation
-        # reward -= abs(battery_action_mw) * 0.01 # Example penalty
 
-        # --- Update State ---
+        # Increment time step BEFORE preparing next observation
         self.current_time_step += 1
+        terminated = self.current_time_step >= self.simulation_duration_hours
+        truncated = False
 
-        # --- Check if episode is done ---
-        terminated = self.current_time_step >= self.data_len
-        truncated = False # Or define other conditions for truncation if needed
+        if not terminated:
+            next_solar_data = self.solar_profile_dict.get(self.current_time_step, {'solar_power_MW': 0.0})
+            next_wind_data = self.wind_profile_dict.get(self.current_time_step, {'wind_power_MW': 0.0})
+            next_load_data = self.load_profile_dict.get(self.current_time_step, {'load_mw': 0.0})
 
-        # --- Create Info Dictionary ---
+
+            next_obs = np.array([
+                self.current_time_step,
+                self.battery.get_current_soc(),
+                next_solar_data.get('solar_power_MW', 0.0),
+                next_wind_data.get('wind_power_MW', 0.0),
+                next_load_data.get('load_mw', 0.0)
+            ], dtype=np.float32)
+        else:
+            next_obs = np.zeros_like(self.observation_space.low)
+
+
         info = {
-            "current_time_step": self.current_time_step -1, # Log the step that just finished
-            "renewable_output_mw": renewable_output_mw,
-            "grid_demand_mw": grid_demand_mw,
-            "battery_soc_kwh": self.battery_soc_kwh,
-            "battery_charge_attempt_mw": battery_charge_attempt_mw,
-            "battery_discharge_attempt_mw": battery_discharge_attempt_mw,
-            "actual_battery_charge_mw": actual_battery_charge_mw,
-            "actual_battery_discharge_mw": actual_battery_discharge_mw,
-            "power_bought_mw": power_bought_mw,
-            "power_sold_mw": power_sold_mw,
-            "unmet_demand_mw": unmet_demand_mw,
-            "reward": reward # Include the immediate reward for this step
+            'time_step': self.current_time_step -1,
+            'solar_power_mw': solar_power_mw_available,
+            'wind_power_mw': wind_power_mw_available,
+            'renewable_output_mw': renewable_output_mw,
+            'battery_soc_kwh': self.battery.get_current_soc(),
+            'battery_charge_attempt_mw': battery_charge_attempt_mw,
+            'battery_discharge_attempt_mw': battery_discharge_attempt_mw,
+            'actual_battery_charge_mw': actual_battery_charge_mw,
+            'actual_battery_discharge_mw': actual_battery_discharge_mw,
+            'net_battery_power_mw': net_battery_power_mw,
+            'current_load_mw': current_load_mw,
+            'net_power_output_mw': total_power_including_battery_mw, # Keep this for info, but logic is different now
+            'power_for_load_mw': power_for_load_mw, # Power directly used for load
+            'power_bought_mw': power_bought_mw,
+            'power_sold_mw': power_sold_mw,
+            'unmet_demand_mw': unmet_demand_mw # This is the amount bought from grid if needed
         }
-
-        # --- Return step results ---
-        # The observation for the *next* state
-        next_obs = self._get_obs()
-
 
         return next_obs, reward, terminated, truncated, info
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # Reset state variables
         self.current_time_step = 0
-        self.battery_soc_kwh = self.battery_capacity_kwh / 2 # Reset battery to half full
+        self.battery.current_soc_kwh = self.battery.min_backup_kwh
 
-        # Get initial observation
-        obs = self._get_obs()
+        initial_solar_data = self.solar_profile_dict.get(self.current_time_step, {'solar_power_MW': 0.0})
+        initial_wind_data = self.wind_profile_dict.get(self.current_time_step, {'wind_power_MW': 0.0})
+        initial_load_data = self.load_profile_dict.get(self.current_time_step, {'load_mw': 0.0})
 
-        # Return initial observation and info
-        info = {
-             "current_time_step": self.current_time_step,
-             "renewable_output_mw": self.combined_renewable_power_mw.iloc[self.current_time_step] if not self.combined_renewable_power_mw.empty else 0,
-             "grid_demand_mw": self.grid_demand_full_mw.iloc[self.current_time_step] if not self.grid_demand_full_mw.empty else 0,
-             "battery_soc_kwh": self.battery_soc_kwh,
-             # Include other initial info if needed, e.g., prices
-         }
-
-        return obs, info
-
-    def _get_obs(self):
-        # Return the current observation
-        if self.current_time_step < self.data_len:
-             renewable_output_mw = self.combined_renewable_power_mw.iloc[self.current_time_step]
-             grid_demand_mw = self.grid_demand_full_mw.iloc[self.current_time_step]
-        else:
-             # If episode is done, return a terminal observation (e.g., zeros or last state)
-             # Or handle this in the step function's termination logic
-             renewable_output_mw = 0
-             grid_demand_mw = 0
-
-
-        obs = np.array([
+        initial_obs = np.array([
             self.current_time_step,
-            renewable_output_mw,
-            grid_demand_mw,
-            self.battery_soc_kwh
+            self.battery.get_current_soc(),
+            initial_solar_data.get('solar_power_MW', 0.0),
+            initial_wind_data.get('wind_power_MW', 0.0),
+            initial_load_data.get('load_mw', 0.0)
         ], dtype=np.float32)
 
-        return obs
+        info = {
+            'battery_soc_kwh': self.battery.get_current_soc(),
+            'grid_demand_mw': initial_load_data.get('load_mw', 0.0)
+        }
 
-    # You might want to add a render method for visualization
-    # def render(self):
-    #     pass
+        return initial_obs, info
 
-    # You might want to add a close method for cleanup
-    # def close(self):
-    #     pass
+    def render(self, mode='human'):
+        pass
 
-
-# Example usage (optional, for testing the environment independently)
-if __name__ == '__main__':
-    # Create an instance of the environment
-    env = HybridPowerPlantEnv()
-
-    # Reset the environment to get the initial state
-    obs, info = env.reset()
-    print("Initial Observation:", obs)
-    print("Initial Info:", info)
-
-    # Take a random action (example)
-    random_action = env.action_space.sample()
-    print("\nTaking random action:", random_action)
-
-    # Step the environment
-    next_obs, reward, terminated, truncated, info = env.step(random_action)
-    print("Next Observation:", next_obs)
-    print("Reward:", reward)
-    print("Terminated:", terminated)
-    print("Truncated:", truncated)
-    print("Info:", info)
-
-    # Run a simple simulation loop (example)
-    print("\nRunning a simple simulation...")
-    obs, info = env.reset()
-    done = False
-    total_reward = 0
-    while not done:
-        action = env.action_space.sample() # Take random actions
-        obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
-        # print(f"Step {env.current_time_step}: Obs={obs}, Reward={reward}, Done={done}, Info={info}")
-        done = terminated or truncated
-    print(f"\nSimple simulation finished with total reward: {total_reward}")
+    def close(self):
+        pass
