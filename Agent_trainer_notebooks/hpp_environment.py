@@ -5,9 +5,9 @@ import pandas as pd
 import os
 
 # Define paths for data files - ADJUST THESE PATHS AS NECESSARY
-SOLAR_DATA_PATH = '/content/solar_data_full.csv'  # Make sure this path is correct
-WIND_DATA_PATH = '/content/wind_data_full.csv'    # Make sure this path is correct
-GRID_DATA_PATH = '/content/grid_data_full.csv'    # Make sure this path is correct
+SOLAR_DATA_PATH = 'https://github.com/fassi16/RL_MS_Thesis/blob/main/data/data_testing/scenario_datasets/PV_load_2020_profile.csv'  # Make sure this path is correct
+WIND_DATA_PATH = 'https://github.com/fassi16/RL_MS_Thesis/blob/main/data/data_testing/scenario_datasets/WT_load_2020_profile.csv'    # Make sure this path is correct
+CONSUMER_DATA_PATH = 'https://github.com/fassi16/RL_MS_Thesis/blob/main/data/data_testing/scenario_datasets/households_load_profile.csv'    # Make sure this path is correct
 
 class HybridPowerPlantEnv(gym.Env):
     """
