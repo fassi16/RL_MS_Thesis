@@ -211,19 +211,8 @@ Instantiate the environment, reset it, and run a simulation loop with random act
 
 *   The current simulation with random actions results in significant unmet demand and grid purchases, indicating the need for an intelligent agent to optimize power flow.
 *   The next step is to train a reinforcement learning agent (e.g., using algorithms like DDPG or SAC suitable for continuous action spaces) within this environment to learn an optimal control policy for managing the hybrid power plant.
-"""
 
-# Combine solar and wind power, filling missing values with 0
-if not solar_data_full.empty and not wind_data_full.empty:
-    combined_renewable_power_mw = solar_data_full['solar_power_MW'].add(wind_data_full['wind_power_MW'], fill_value=0)
-
-    # Display the head of the combined renewable power data
-    print("Head of Combined Renewable Power (MW):")
-    display(combined_renewable_power_mw.head())
-else:
-    print("Cannot combine renewable power. One or both of the datasets are empty.")
-
-"""## Data analysis
+## Data analysis
 
 ### Subtask:
 Define day and night periods and analyze renewable production by day/night, month, and year.
@@ -840,7 +829,7 @@ base_url = "https://raw.githubusercontent.com/fassi16/RL_MS_Thesis/main/data/dat
 files_to_download = [
     "PV_load_2020_profile.csv",
     "WT_load_2020_profile.csv",
-    "House_load_2020_profile.csv"
+    "households_load_profile.csv"
 ]
 
 for file_name in files_to_download:
@@ -856,23 +845,8 @@ for file_name in files_to_download:
 
 """**Reasoning**:
 The previous download attempts for the household load data failed. The user has provided a new potential file name: `households_load_profile.csv`. I will attempt to download the file with this name from the same base URL.
-"""
 
-import requests
-
-base_url = "https://raw.githubusercontent.com/fassi16/RL_MS_Thesis/main/data/data_testing/scenario_datasets/"
-file_name = "households_load_profile.csv" # New file name provided by the user
-url = base_url + file_name
-response = requests.get(url)
-
-if response.status_code == 200:
-    with open(file_name, "wb") as f:
-        f.write(response.content)
-    print(f"Downloaded {file_name} successfully.")
-else:
-    print(f"Failed to download {file_name}. Status code: {response.status_code}")
-
-"""## Visualize Profiles
+## Visualize Profiles
 
 ### Subtask:
 Visualize the solar generation, wind generation, and household load profiles loaded into the environment.
