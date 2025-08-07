@@ -229,7 +229,7 @@ I will define the start and end hours for day and night according to the updated
 
 if 'simulation_df' in locals() and not simulation_df.empty:
     print("Grid Demand (MW) for each hour of the simulation:")
-    display(simulation_df['grid_demand_mw'])
+    display(simulation_df['current_load_mw'])
 else:
     print("Simulation results DataFrame (simulation_df) not found or is empty. Please run the simulation cell first.")
 
@@ -262,7 +262,7 @@ import matplotlib.pyplot as plt
 # Define the environment classes again to ensure they are available and updated
 class HybridPowerPlant:
     def __init__(self, total_capacity_mw):
-        self.total_capacity_mw = total_capacity_mw
+        self.total_capacity_mw = total_capacity_mw # Use the parameter passed to __init__
         self.components = {}
 
     def add_component(self, name, capacity_mw, type):
@@ -317,7 +317,7 @@ class BatteryStorage:
 
 
 class HybridPowerPlantEnv(gym.Env):
-    def __init__(self, total_plant_capacity_mw=100, battery_capacity_kwh=1000, battery_min_backup_kwh=200, battery_max_charge_mw=50, battery_max_discharge_mw=50, simulation_duration_hours=8760): # Set duration to a full year
+    def __init__(self, total_plant_capacity_mw=100, battery_capacity_kwh=1000, battery_min_backup_kwh=200, battery_max_charge_mw=50, battery_max_discharge_mw=50, simulation_duration_hours=8760, cost_per_kWh=17.5, revenue_per_kWh=12.0): # Set duration to a full year
         super().__init__()
 
         self.total_plant_capacity_mw = total_plant_capacity_mw
@@ -325,8 +325,8 @@ class HybridPowerPlantEnv(gym.Env):
         self.current_time_step = 0
 
         self.plant = HybridPowerPlant(total_capacity_mw=self.total_plant_capacity_mw)
-        self.plant.add_component('SolarFarm', capacity_mw=60, type='solar')
-        self.plant.add_component('WindTurbines', capacity_mw=40, type='wind')
+        self.plant.add_component('SolarFarm', capacity_mw=50, type='solar')
+        self.plant.add_component('WindTurbines', capacity_mw=50, type='wind')
         self.plant.add_component('Battery', capacity_mw=battery_max_charge_mw, type='battery')
 
         self.battery = BatteryStorage(total_capacity_kwh=battery_capacity_kwh,
@@ -400,10 +400,27 @@ class HybridPowerPlantEnv(gym.Env):
                                            high=np.array([1.0], dtype=np.float32), # +1 for max discharge
                                            dtype=np.float32)
 
-        self.cost_buy = 0.25 # Increased cost to incentivize selling/self-consumption
-        self.revenue_sell = 0.10
-        self.penalty_unmet_demand = 5.0 # Increased penalty
-        self.battery_usage_cost = 0.005
+        # Define cost and revenue based on PKR per kWh and convert to per MWh for calculations
+        self.cost_per_kWh = cost_per_kWh # 17.5 PKR per kWh
+        self.cost_per_MWh = self.cost_per_kWh * 1000 # 17500 PKR per MWh
+        self.revenue_per_kWh = revenue_per_kWh # 12.0 PKR per kWh sell back rate
+        self.cost_buy = self.cost_per_MWh # Cost to buy per MWh (17500 PKR)
+        self.revenue_sell = self.revenue_per_kWh * 1000 # Revenue from selling per MWh (12000 PKR)
+
+        self.penalty_unmet_demand = self.cost_buy * 1.5 # Increased penalty related to buying cost
+        self.battery_usage_cost = 0.005 * 1000 # Small cost per MWh of battery usage (assuming 0.005 PKR/kWh)
+
+        # Initialize KPI trackers
+        self.total_energy_produced_kWh = 0
+        self.total_energy_consumed_kWh = 0
+        self.total_energy_stored_kWh = 0
+        self.total_energy_discharged_kWh = 0
+        self.total_energy_bought_kWh = 0
+        self.total_energy_sold_kWh = 0
+        self.total_unmet_demand_kWh = 0
+        self.total_revenue_from_sales = 0
+        self.total_cost_of_buying = 0
+        self.total_battery_usage_cost = 0
 
 
     def _load_and_process_profiles(self):
@@ -718,12 +735,30 @@ class HybridPowerPlantEnv(gym.Env):
         # Reward selling to grid (only from renewable surplus after load and battery charging)
         reward += power_sold_mw * self.revenue_sell
 
-        # Add a small cost for battery usage
-        reward -= (actual_battery_charge_mw + actual_battery_discharge_mw) * self.battery_usage_cost
+        # Add a small cost for battery usage (convert kWh to MWh for consistency if cost is per MWh)
+        # Assuming actual_battery_charge_mw and actual_battery_discharge_mw are average MW over 1 hour
+        battery_energy_used_mwh = (actual_battery_charge_mw + actual_battery_discharge_mw) * 1 # Energy in MWh
+        reward -= battery_energy_used_mwh * self.battery_usage_cost
 
-        # Penalty for dropping below minimum backup SOC
-        if self.battery.get_current_soc() < self.battery.min_backup_kwh:
-             reward -= (self.battery.min_backup_kwh - self.battery.get_current_soc()) * 0.1
+        # Penalty for dropping below minimum backup SOC (convert kWh to MWh for consistency if penalty is per MWh)
+        # Assuming penalty is per MWh equivalent below min backup
+        soc_below_min_kwh = max(0, self.battery.min_backup_kwh - self.battery.get_current_soc())
+        soc_below_min_mwh = soc_below_min_kwh / 1000.0
+        reward -= soc_below_min_mwh * (self.cost_buy * 0.1) # Penalty proportional to buying cost
+
+        # Update KPI trackers (assuming 1 hour time step, MW * 1 = MWh, convert to kWh by * 1000)
+        time_step_hours = 1 # Assuming a 1 hour time step
+
+        self.total_energy_produced_kWh += (solar_power_mw_available + wind_power_mw_available) * time_step_hours * 1000
+        self.total_energy_consumed_kWh += current_load_mw * time_step_hours * 1000
+        self.total_energy_stored_kWh = self.battery.get_current_soc() # SOC is already in kWh
+        self.total_energy_discharged_kWh += actual_battery_discharge_mw * time_step_hours * 1000
+        self.total_energy_bought_kWh += power_bought_mw * time_step_hours * 1000
+        self.total_energy_sold_kWh += power_sold_mw * time_step_hours * 1000
+        self.total_unmet_demand_kWh += unmet_demand_mw * time_step_hours * 1000
+        self.total_revenue_from_sales += power_sold_mw * time_step_hours * self.revenue_sell # revenue_sell is PKR/MWh, power_sold_mw * 1 is MWh
+        self.total_cost_of_buying += power_bought_mw * time_step_hours * self.cost_buy # cost_buy is PKR/MWh, power_bought_mw * 1 is MWh
+        self.total_battery_usage_cost += battery_energy_used_mwh * self.battery_usage_cost # battery_usage_cost is PKR/MWh, battery_energy_used_mwh is MWh
 
 
         # Increment time step BEFORE preparing next observation
@@ -764,7 +799,20 @@ class HybridPowerPlantEnv(gym.Env):
             'power_for_load_mw': power_for_load_mw, # Power directly used for load
             'power_bought_mw': power_bought_mw,
             'power_sold_mw': power_sold_mw,
-            'unmet_demand_mw': unmet_demand_mw # This is the amount bought from grid if needed
+            'unmet_demand_mw': unmet_demand_mw, # This is the amount bought from grid if needed
+
+            # Add KPI trackers to info
+            'total_energy_produced_kWh': self.total_energy_produced_kWh,
+            'total_energy_consumed_kWh': self.total_energy_consumed_kWh,
+            'total_energy_stored_kWh': self.total_energy_stored_kWh,
+            'total_energy_discharged_kWh': self.total_energy_discharged_kWh,
+            'total_energy_bought_kWh': self.total_energy_bought_kWh,
+            'total_energy_sold_kWh': self.total_energy_sold_kWh,
+            'total_unmet_demand_kWh': self.total_unmet_demand_kWh,
+            'total_revenue_from_sales': self.total_revenue_from_sales,
+            'total_cost_of_buying': self.total_cost_of_buying,
+            'total_battery_usage_cost': self.total_battery_usage_cost,
+
         }
 
         return next_obs, reward, terminated, truncated, info
@@ -774,6 +822,19 @@ class HybridPowerPlantEnv(gym.Env):
 
         self.current_time_step = 0
         self.battery.current_soc_kwh = self.battery.min_backup_kwh
+
+        # Reset KPI trackers
+        self.total_energy_produced_kWh = 0
+        self.total_energy_consumed_kWh = 0
+        self.total_energy_stored_kWh = 0
+        self.total_energy_discharged_kWh = 0
+        self.total_energy_bought_kWh = 0
+        self.total_energy_sold_kWh = 0
+        self.total_unmet_demand_kWh = 0
+        self.total_revenue_from_sales = 0
+        self.total_cost_of_buying = 0
+        self.total_battery_usage_cost = 0
+
 
         initial_solar_data = self.solar_profile_dict.get(self.current_time_step, {'solar_power_MW': 0.0})
         initial_wind_data = self.wind_profile_dict.get(self.current_time_step, {'wind_power_MW': 0.0})
@@ -789,8 +850,20 @@ class HybridPowerPlantEnv(gym.Env):
 
         info = {
             'battery_soc_kwh': self.battery.get_current_soc(),
-            'grid_demand_mw': initial_load_data.get('load_mw', 0.0)
+            'grid_demand_mw': initial_load_data.get('load_mw', 0.0),
+             # Include initial KPI values in info (they will be 0)
+            'total_energy_produced_kWh': self.total_energy_produced_kWh,
+            'total_energy_consumed_kWh': self.total_energy_consumed_kWh,
+            'total_energy_stored_kWh': self.total_energy_stored_kWh,
+            'total_energy_discharged_kWh': self.total_energy_discharged_kWh,
+            'total_energy_bought_kWh': self.total_energy_bought_kWh,
+            'total_energy_sold_kWh': self.total_energy_sold_kWh,
+            'total_unmet_demand_kWh': self.total_unmet_demand_kWh,
+            'total_revenue_from_sales': self.total_revenue_from_sales,
+            'total_cost_of_buying': self.total_cost_of_buying,
+            'total_battery_usage_cost': self.total_battery_usage_cost,
         }
+
 
         return initial_obs, info
 
@@ -963,6 +1036,11 @@ try:
     # Convert list of dictionaries to a pandas DataFrame for easier analysis
     simulation_df = pd.DataFrame(simulation_info)
 
+    # Calculate total energy sold to the grid in kWh
+    simulation_df['energy_sold_kwh'] = simulation_df['power_sold_mw'] * 1000  # MW to kWh
+    total_units_to_grid = simulation_df['energy_sold_kwh'].sum()
+    print(f"\nTotal energy sold to the grid during simulation: {total_units_to_grid:.2f} kWh")
+
     print("\nSimulation DataFrame Head:")
     display(simulation_df.head())
 
@@ -1011,14 +1089,14 @@ try:
         plt.grid(True)
         plt.show()
 
-        # Plot Power Sold to Grid
-        plt.figure(figsize=(15, 5))
-        plt.plot(simulation_df['time_step'], simulation_df['power_sold_mw'], label='Power Sold (MW)', color='blue')
-        plt.ylabel('Power (MW)')
-        plt.xlabel('Time Step (hour)')
-        plt.title('Power Sold to Grid Over Time')
-        plt.legend()
+        # Plot Power Sold to Grid (User's requested plot)
+        plt.figure(figsize=(12, 6))
+        plt.plot(simulation_df['time_step'], simulation_df['power_sold_mw'], label='Power Sold to Grid (MW)')
+        plt.xlabel("Hour")
+        plt.ylabel("MW")
+        plt.title("Power Sold to Grid Over Time")
         plt.grid(True)
+        plt.legend()
         plt.show()
 
         # Plot Unmet Demand
